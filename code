@@ -1,0 +1,345 @@
+#include <Adafruit_Fingerprint.h>
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoHttpClient.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+#define EEPROM_ID_ADDR 0
+#define MAX_ID 127
+#define EEPROM_OFFSET 10
+
+#define NAME_SIZE 20
+#define PATH_SIZE 30
+#define USER_INFO_SIZE (1 + NAME_SIZE + PATH_SIZE)  // count + name + path
+#define EEPROM_USER_START EEPROM_OFFSET
+
+#define BUTTON D5
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+String name = "";
+String FIREBASE_PATH = "";
+
+const char* ssid = "Beta";
+const char* password = "9944117961";
+const char FIREBASE_HOST[] = "mediapp-3f330-default-rtdb.firebaseio.com";
+const String FIREBASE_AUTH = "6nj2VLa9vHGNJgwdhjlZLqrq18iJDBekgy3NeYvA";
+
+const int SSL_PORT = 443;
+WiFiClientSecure wifiClient;
+HttpClient httpClient = HttpClient(wifiClient, FIREBASE_HOST, SSL_PORT);
+
+SoftwareSerial mySerial(2, 12); // RX, TX
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+
+int currentID = 1;
+
+// Save user info (name, path)
+void saveUserInfo(int id, const String& name, const String& path) {
+  int base = EEPROM_USER_START + (id * USER_INFO_SIZE);
+  EEPROM.write(base, 0);  // Initial count = 0
+  for (int i = 0; i < NAME_SIZE; i++)
+    EEPROM.write(base + 1 + i, i < name.length() ? name[i] : 0);
+  for (int i = 0; i < PATH_SIZE; i++)
+    EEPROM.write(base + 1 + NAME_SIZE + i, i < path.length() ? path[i] : 0);
+  EEPROM.commit();
+}
+
+// Load user info
+void loadUserInfo(int id, String &name, String &path, uint8_t &count) {
+  int base = EEPROM_USER_START + (id * USER_INFO_SIZE);
+  count = EEPROM.read(base);
+  name = "";
+  path = "";
+  for (int i = 0; i < NAME_SIZE; i++) {
+    char c = EEPROM.read(base + 1 + i);
+    if (c == 0) break;
+    name += c;
+  }
+  for (int i = 0; i < PATH_SIZE; i++) {
+    char c = EEPROM.read(base + 1 + NAME_SIZE + i);
+    if (c == 0) break;
+    path += c;
+  }
+}
+
+void updateUserCount(int id, uint8_t count) {
+  int base = EEPROM_USER_START + (id * USER_INFO_SIZE);
+  EEPROM.write(base, count);
+  EEPROM.commit();
+}
+
+void listAllUsers() {
+  Serial.println("Listing all enrolled users:");
+  for (int id = 1; id <= MAX_ID; id++) {
+    String uname, path;
+    uint8_t count;
+    loadUserInfo(id, uname, path, count);
+    if (uname.length() > 0 && path.length() > 0) {
+      Serial.print("ID: "); Serial.print(id);
+      Serial.print(" | Name: "); Serial.print(uname);
+      Serial.print(" | Path: "); Serial.print(path);
+      Serial.print(" | Count: "); Serial.println(count);
+    }
+  }
+}
+
+void postToFirebase(const char* method, String& path, const String& data) {
+  String url = path + ".json?auth=" + FIREBASE_AUTH;
+  Serial.println("Sending data to Firebase...");
+  Serial.println("URL: " + url);
+  Serial.println("Data: " + data);
+
+  httpClient.beginRequest();
+  httpClient.patch(url, "application/json", data);
+  httpClient.endRequest();
+
+  int statusCode = httpClient.responseStatusCode();
+  String response = httpClient.responseBody();
+
+  Serial.print("Status: "); Serial.println(statusCode);
+  Serial.print("Response: "); Serial.println(response);
+
+  if (!httpClient.connected()) httpClient.stop();
+}
+
+uint8_t getFingerprintEnroll() {
+  int p = -1;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Place finger");
+  Serial.println("Place finger...");
+
+  // Wait for good image
+  while ((p = finger.getImage()) != FINGERPRINT_OK);
+
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.print("1st Img Fail");
+    Serial.println("Failed to convert image 1");
+    delay(2000);
+    return false;
+  }
+
+  lcd.clear();
+  lcd.print("Remove finger");
+  Serial.println("Remove finger...");
+  delay(2000);
+  while (finger.getImage() != FINGERPRINT_NOFINGER);
+
+  lcd.clear();
+  lcd.print("Place same");
+  lcd.setCursor(0, 1);
+  lcd.print("finger again");
+  Serial.println("Place same finger again...");
+  while ((p = finger.getImage()) != FINGERPRINT_OK);
+
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.print("2nd Img Fail");
+    Serial.println("Failed to convert image 2");
+    delay(2000);
+    return false;
+  }
+
+  p = finger.createModel();
+  if (p != FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.print("Model Fail");
+    Serial.println("Could not create model");
+    delay(2000);
+    return false;
+  }
+
+  p = finger.storeModel(currentID);
+  if (p == FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.print("Enroll Success");
+    Serial.println("Fingerprint enrolled!");
+    delay(2000);
+    return true;
+  } else {
+    lcd.clear();
+    lcd.print("Store Fail");
+    Serial.println("Could not store fingerprint");
+    delay(2000);
+    return false;
+  }
+}
+
+
+int getFingerprintID() {
+  if (finger.getImage() != FINGERPRINT_OK) lcd.print("image failed");return -1;
+  if (finger.image2Tz() != FINGERPRINT_OK)lcd.print("img2Tz failed") return -1;
+  if (finger.fingerSearch() != FINGERPRINT_OK)lcd.print("search failed") return -1;
+  return finger.fingerID;
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(BUTTON, INPUT_PULLUP);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("Initializing...");
+  delay(2000); lcd.clear();
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected");
+  lcd.setCursor(0, 0); lcd.print("WiFi Connected");
+  delay(2000); lcd.clear();
+
+  wifiClient.setInsecure();
+  httpClient.setHttpResponseTimeout(10000);
+
+  finger.begin(57600);
+  lcd.setCursor(0, 0);
+  lcd.print("connecting");
+  lcd.setCursor(0, 1);
+  lcd.print("to sensor..");
+  delay(10000);
+  lcd.clear();
+  if (finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor OK");
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor OK");
+  } else {
+    Serial.println("Sensor NOT found");
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Failed");
+    while (1);
+  }
+  delay(2000); lcd.clear();
+
+
+  EEPROM.begin(4096);
+  currentID = EEPROM.read(EEPROM_ID_ADDR);
+  if (currentID < 1 || currentID > MAX_ID) currentID = 1;
+
+  Serial.print("Start ID: "); Serial.println(currentID);
+  lcd.setCursor(0, 0); lcd.print("Ready ID: ");
+  lcd.print(currentID);
+  delay(2000); lcd.clear();
+  Serial.println("Type ENROLL, DELETE <id>, DELETEALL, LIST");
+}
+
+void loop() {
+  if (Serial.available()) {
+    delay(100);
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    Serial.println("Received Command: [" + cmd + "]");
+
+    if (cmd.equalsIgnoreCase("ENROLL")) {
+      Serial.println("Enter name:");
+      while (!Serial.available());
+      String newName = Serial.readStringUntil('\n');
+      newName.trim();
+
+      Serial.println("Enter Firebase path (e.g., /SANJEEV):");
+      while (!Serial.available());
+      String newPath = Serial.readStringUntil('\n');
+      newPath.trim();
+
+      Serial.println("Enrolling new fingerprint...");
+      lcd.clear(); lcd.setCursor(0, 0); lcd.print("Enrolling...");
+
+      if (getFingerprintEnroll()) {
+        saveUserInfo(currentID, newName, newPath);
+        Serial.println("Enrolled ID " + String(currentID) + " as " + newName + " to path " + newPath);
+        currentID++;
+        if (currentID > MAX_ID) currentID = 1;
+        EEPROM.write(EEPROM_ID_ADDR, currentID);
+        EEPROM.commit();
+      } else {
+        Serial.println("Enroll failed");
+      }
+    }
+
+   else if (cmd.equalsIgnoreCase("DELETEALL")) {
+  finger.emptyDatabase();
+  Serial.println("All fingerprints deleted");
+
+  for (int id = 1; id <= MAX_ID; id++) {
+    int base = EEPROM_USER_START + (id * USER_INFO_SIZE);
+    for (int i = 0; i < USER_INFO_SIZE; i++) {
+      EEPROM.write(base + i, 0);
+    }
+  }
+  EEPROM.write(EEPROM_ID_ADDR, 1); // Reset currentID to 1
+  EEPROM.commit();
+  Serial.println("All EEPROM user data cleared");
+}
+
+  else if (cmd.startsWith("DELETE ")) {
+  int id = cmd.substring(7).toInt();
+  if (finger.deleteModel(id) == FINGERPRINT_OK) {
+    Serial.println("Deleted ID " + String(id));
+
+    // Clear EEPROM data for this ID
+    int base = EEPROM_USER_START + (id * USER_INFO_SIZE);
+    for (int i = 0; i < USER_INFO_SIZE; i++) {
+      EEPROM.write(base + i, 0);
+    }
+    EEPROM.commit();
+    Serial.println("Cleared EEPROM data for ID " + String(id));
+  } else {
+    Serial.println("Failed to delete ID " + String(id));
+  }
+}
+
+
+    else if (cmd.equalsIgnoreCase("LIST")) {
+      listAllUsers();
+    }
+
+    else {
+      Serial.println("Invalid command. Use ENROLL, DELETE <id>, DELETEALL, LIST");
+    }
+  }
+
+  else {
+    int fid = getFingerprintID();
+    if (fid > 0 && fid <= MAX_ID) {
+      String uname, path;
+      uint8_t count;
+      loadUserInfo(fid, uname, path, count);
+
+      if (uname.length() == 0 || path.length() == 0) return;
+
+      count++;
+      updateUserCount(fid, count);
+      bool state = count % 2 == 1;
+      String status = state ? "\"OUT\"" : "\"IN\"";
+
+      Serial.print("ID "); Serial.print(fid);
+      Serial.print(" -> "); Serial.print(uname);
+      Serial.print(" : "); Serial.println(status);
+
+      lcd.clear();
+      //lcd.setCursor(0, 0); lcd.print("ID:"); lcd.print(fid);
+      lcd.setCursor(0, 0); lcd.print(uname);
+      lcd.setCursor(0, 1); lcd.print(status);
+      if (status=="OUT"){
+        lcd.setCursor(0, 0); lcd.print("Thank you....");
+        delay(5000);
+        lcd.setCursor(0, 0); lcd.print("ready to ");
+        lcd.setCursor(0, 1); lcd.print("enroll");
+      }
+      //delay(2000); lcd.clear();
+
+      String json = "{\"" + uname + "\":" + status + "}";
+      postToFirebase("PATCH", path, json);
+      delay(2000);
+    }
+   
+  }
+}
